@@ -5,12 +5,12 @@
 
 # example local and export
 #   docker builder prune -a 
-#   docker build . -f DockerfileLocal -t certwarden-client:v0.5.0-a3
-#   docker save -o ./out/cwc0.5.0-a3.tar certwarden-client:v0.5.0-a3
+#   docker build . -f DockerfileLocal -t certwarden-client:v0.6.0-a1
+#   docker save -o ./out/cwc0.6.0-a1.tar certwarden-client:v0.6.0-a1
 # import into docker
-#   docker load -i ./out/cwc0.5.0-a3.tar
+#   docker load -i ./out/cwc0.6.0-a1.tar
 
-# Versions - keep in sync with build_releases.yml
+# Versions - keep Dockerfile and DockerfileLocal in sync
 ARG ALPINE_VERSION=3.21
 ARG GO_VERSION=1.24.2
 # https://hub.docker.com/_/alpine
@@ -38,7 +38,4 @@ COPY ./README.md .
 COPY ./CHANGELOG.md .
 COPY ./LICENSE.md .
 
-# https server
-EXPOSE 5055/tcp
-
-CMD /app/certwarden-client-linux-amd64
+CMD ["/app/certwarden-client-linux-amd64"]

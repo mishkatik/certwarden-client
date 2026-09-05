@@ -1,0 +1,7 @@
+.git
+.github
+.vscode
+.dockerignore
+out
+run-test*.ps1
+docker-compose*.yml

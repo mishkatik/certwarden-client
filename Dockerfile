@@ -1,11 +1,12 @@
 # example build:
-# docker build . --build-arg=VERSION=v0.1.0 -t certwarden-client:v0.1.0
+# docker build . -t certwarden-client:v0.6.0
 
 # example run
 # NOTE: If you don't want or need auto container restart, you can skip mounting docker.sock
-# docker run -d --name certwarden-client -e TZ=Europe/Stockholm -v /var/run/docker.sock:/var/run/docker.sock -p 5055:5055 -e [config vars here] ghcr.io/gregtwallace/certwarden-client:latest
+# NOTE: no port to publish: the client polls the Cert Warden server and runs no server itself
+# docker run -d --name certwarden-client -e TZ=Europe/Stockholm -v /var/run/docker.sock:/var/run/docker.sock -e [config vars here] ghcr.io/mishkatik/certwarden-client:latest
 
-# Versions - keep in sync with build_releases.yml
+# Versions - keep Dockerfile and DockerfileLocal in sync
 ARG ALPINE_VERSION=3.21
 ARG GO_VERSION=1.24.2
 # https://hub.docker.com/_/alpine
@@ -13,13 +14,14 @@ ARG GO_VERSION=1.24.2
 
 FROM golang:${GO_VERSION}-alpine${ALPINE_VERSION} AS build
 
+# informational only; the image builds from this repository's source tree
 ARG VERSION
 
 WORKDIR /
 
-RUN apk add git && \
-    git clone --depth 1 --branch "${VERSION}" https://github.com/gregtwallace/certwarden-client.git /src && \
-    cd /src && \
+COPY ./ ./src
+
+RUN cd /src && \
     go build -o ./certwarden-client ./pkg/main
 
 FROM alpine:${ALPINE_VERSION}
@@ -35,7 +37,4 @@ COPY ./README.md .
 COPY ./CHANGELOG.md .
 COPY ./LICENSE.md .
 
-# https server
-EXPOSE 5055/tcp
-
-CMD /app/certwarden-client
+CMD ["/app/certwarden-client"]
