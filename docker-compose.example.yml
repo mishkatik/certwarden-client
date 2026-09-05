@@ -1,0 +1,30 @@
+services:
+  certwardenclient:
+    image: ghcr.io/mishkatik/certwarden-client:latest
+    container_name: certwardenclient
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /opt/certwardenclient/certs:/opt/certwarden/certs
+    environment:
+      TZ: "Europe/Moscow"
+      CW_CLIENT_SERVER_ADDRESS: "https://certwarden.example.com"
+      # How often to poll the server for a new key/cert (Go duration, default 6h, minimum 1m).
+      # After a failed poll the client retries after 15m, doubling up to this interval.
+      CW_CLIENT_POLL_INTERVAL: "6h"
+      # Certificate 0 (add CW_CLIENT_1_* for a second certificate, and so on)
+      CW_CLIENT_0_CERT_NAME: "example.com"
+      CW_CLIENT_0_CERT_APIKEY: "<certificate api key from Cert Warden>"
+      CW_CLIENT_0_KEY_APIKEY: "<private key api key from Cert Warden>"
+      CW_CLIENT_0_FILE_UPDATE_TIME_START: "02:00"
+      CW_CLIENT_0_FILE_UPDATE_TIME_END: "03:00"
+      CW_CLIENT_0_FILE_UPDATE_DAYS_OF_WEEK: "Mon Tue Wed Thu Fri Sat Sun"
+      CW_CLIENT_0_RESTART_DOCKER_CONTAINER0: "remnawave-nginx"
+      CW_CLIENT_0_CERT_PATH: "/opt/certwarden/certs"
+      CW_CLIENT_0_KEY_PEM_FILENAME: "privkey.pem"
+      CW_CLIENT_0_CERTCHAIN_PEM_FILENAME: "fullchain.pem"
+    logging:
+      driver: 'json-file'
+      options:
+        max-size: '30m'
+        max-file: '5'
