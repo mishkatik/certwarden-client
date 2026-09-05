@@ -2,9 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -24,7 +21,7 @@ import (
 )
 
 // Environment Variables (to configure client):
-// 		Certificate specific items include an index (e.g., CW_CLIENT_AES_KEY_BASE64 vs. CW_CLIENT_0_AES_KEY_BASE64)
+// 		Certificate specific items include an index (e.g., CW_CLIENT_CERT_NAME vs. CW_CLIENT_0_CERT_NAME)
 //		If the index is missing, the assumed index will be 0. It is highly recommended you ALWAYS use the index. The
 //		non-indexed parsing to an assumed 0 only remains for backward compatibility.
 
@@ -33,17 +30,16 @@ import (
 //			CW_CLIENT_SERVER_ADDRESS	-	DNS name of the server. Must start with https and have a valid ssl certificate.
 //
 //		Certificate Specific:
-//    	CW_CLIENT_0_AES_KEY_BASE64  - base64 raw url encoding of AES key used for communication between server and client (generate one on server)
-//			CW_CLIENT_0_KEY_NAME				-	Name of private key in server
-//			CW_CLIENT_0_KEY_APIKEY			- API Key of private key in server
-//			CW_CLIENT_0_CERT_NAME				- Name of certificate in server
+//			CW_CLIENT_0_CERT_NAME				- Name of certificate in server (this var defines that cert index 0 exists)
 //			CW_CLIENT_0_CERT_APIKEY			- API Key of certificate in server
+//			CW_CLIENT_0_KEY_APIKEY			- API Key of the certificate's private key in server
 
 // Optional:
 //		Client Global:
 //			CW_CLIENT_LOGLEVEL									- zap log level for the app
-//			CW_CLIENT_BIND_ADDRESS							- address to bind the https server to
-//			CW_CLIENT_BIND_PORT									- https server port
+//			CW_CLIENT_POLL_INTERVAL							- how often the client polls the server for key/cert updates, as a Go duration (e.g. 30m, 6h); default 6h, minimum 1m
+//				Note: The first poll runs at start. After a failed poll the client retries after 15 minutes (or the poll
+//				interval, if shorter), doubling on each consecutive failure up to the poll interval.
 
 //		Certificate Specific:
 //			CW_CLIENT_0_FILE_UPDATE_TIME_START		- 24-hour time when window opens to write key/cert updates to filesystem
@@ -72,6 +68,11 @@ import (
 //    	CW_CLIENT_0_PFX_LEGACY_FILENAME		- if pfx create enabled, the filename for the legacy pfx generated
 //    	CW_CLIENT_0_PFX_LEGACY_PASSWORD		- if pfx create enabled, the password for the legacy pfx file generated
 
+// Deprecated (no longer used; ignored if set):
+//			CW_CLIENT_BIND_ADDRESS, CW_CLIENT_BIND_PORT	- the client no longer runs an https server
+//			CW_CLIENT_0_AES_KEY_BASE64									- the client polls the server instead of receiving pushed updates
+//			CW_CLIENT_0_KEY_NAME												- the client fetches the private key together with the certificate and needs only the key's API key
+
 // defaults for Optional vars
 const (
 	defaultUpdateTimeStartHour   = 3
@@ -82,9 +83,13 @@ const (
 
 	defaultRestartDockerStopOnly = false
 
-	defaultLogLevel    = zapcore.InfoLevel
-	defaultBindAddress = ""
-	defaultBindPort    = 5055
+	defaultLogLevel = zapcore.InfoLevel
+
+	defaultPollInterval = 6 * time.Hour
+	minPollInterval     = 1 * time.Minute
+	// pollRetryInterval is the initial delay before polling again after a failed poll; it doubles on each
+	// consecutive failure until it reaches the configured poll interval
+	pollRetryInterval = 15 * time.Minute
 
 	defaultCertStoragePath = "/opt/certwarden/certs"
 	defaultKeyPermissions  = fs.FileMode(0600)
@@ -113,9 +118,14 @@ type app struct {
 	dockerAPIClient *dockerClient.Client
 
 	// one for each cert (index corresponds to cfg index)
-	tlsCerts          []*SafeCert // 0 is always used for the Client's https cert
+	tlsCerts []*SafeCert
+	// pendingJobCancels holds the cancel func of the pending file write job of each cert (nil if none);
+	// the poll goroutine and the jobs themselves write it, so pendingJobMu guards it
+	pendingJobMu      sync.Mutex
 	pendingJobCancels []context.CancelFunc
-	cipherAEAD        []cipher.AEAD
+	// pollETags holds the ETag of the last key/cert fetched from the server; the next poll sends it
+	// so the server can answer 304 Not Modified if nothing changed
+	pollETags []string
 }
 
 // certConfig contains all of the configuration specific to
@@ -129,7 +139,6 @@ type certConfig struct {
 	FileUpdateDaysOfWeek           map[time.Weekday]struct{}
 	DockerContainersToRestart      []string
 	DockerStopOnly                 bool
-	KeyName                        string
 	KeyApiKey                      string
 	CertName                       string
 	CertApiKey                     string
@@ -148,9 +157,8 @@ type certConfig struct {
 
 // config holds all of the client configuration
 type config struct {
-	BindAddress   string
-	BindPort      int
 	ServerAddress string
+	PollInterval  time.Duration
 	Certs         []certConfig
 }
 
@@ -189,20 +197,27 @@ func configureApp() (*app, error) {
 
 	// Global: Optional
 
-	// CW_CLIENT_BIND_ADDRESS
-	app.cfg.BindAddress = os.Getenv("CW_CLIENT_BIND_ADDRESS")
-	if app.cfg.BindAddress == "" {
-		app.logger.Debugf("CW_CLIENT_BIND_ADDRESS not specified, using default \"%s\"", defaultBindAddress)
-		app.cfg.BindAddress = defaultBindAddress
+	// CW_CLIENT_POLL_INTERVAL
+	pollIntervalStr := os.Getenv("CW_CLIENT_POLL_INTERVAL")
+	if pollIntervalStr == "" {
+		app.logger.Debugf("CW_CLIENT_POLL_INTERVAL not specified, using default \"%s\"", defaultPollInterval)
+		app.cfg.PollInterval = defaultPollInterval
+	} else {
+		pollInterval, err := time.ParseDuration(pollIntervalStr)
+		if err != nil || pollInterval < minPollInterval {
+			app.logger.Warnf("CW_CLIENT_POLL_INTERVAL \"%s\" is invalid or less than the minimum of %s, using default \"%s\"", pollIntervalStr, minPollInterval, defaultPollInterval)
+			app.cfg.PollInterval = defaultPollInterval
+		} else {
+			app.cfg.PollInterval = pollInterval
+		}
 	}
+	app.logger.Infof("polling server for key/cert updates every %s (after a failed poll, retry starts at %s and doubles up to the poll interval)", app.cfg.PollInterval, min(pollRetryInterval, app.cfg.PollInterval))
 
-	// CW_CLIENT_BIND_PORT
-	var err error
-	bindPort := os.Getenv("CW_CLIENT_BIND_PORT")
-	app.cfg.BindPort, err = strconv.Atoi(bindPort)
-	if bindPort == "" || err != nil || app.cfg.BindPort < 1 || app.cfg.BindPort > 65535 {
-		app.logger.Debugf("CW_CLIENT_BIND_PORT not specified or invalid, using default \"%d\"", defaultBindPort)
-		app.cfg.BindPort = defaultBindPort
+	// Global: Deprecated
+	for _, deprecatedVar := range []string{"CW_CLIENT_BIND_ADDRESS", "CW_CLIENT_BIND_PORT"} {
+		if os.Getenv(deprecatedVar) != "" {
+			app.logger.Warnf("%s is set but is no longer used (the client no longer runs an https server), ignoring", deprecatedVar)
+		}
 	}
 
 	// Configure each cert
@@ -215,50 +230,19 @@ func configureApp() (*app, error) {
 
 		// Cert: Mandatory
 
-		// CW_CLIENT_AES_KEY_BASE64
-		secretB64 := os.Getenv(prefix + "AES_KEY_BASE64")
+		// CW_CLIENT_CERT_NAME (the presence of this var is what defines a cert index exists)
+		cert.CertName = os.Getenv(prefix + "CERT_NAME")
 
 		// backwards compat prefix if _0_ wasn't found
-		if certIndex == 0 && secretB64 == "" {
+		if certIndex == 0 && cert.CertName == "" {
 			prefix = "CW_CLIENT_"
-			secretB64 = os.Getenv(prefix + "AES_KEY_BASE64")
+			cert.CertName = os.Getenv(prefix + "CERT_NAME")
 		}
 
 		// done loading certs, found an index that doesn't exist (not including 0 which is required)
-		if secretB64 == "" && certIndex > 0 {
+		if cert.CertName == "" && certIndex > 0 {
 			break
 		}
-
-		aesKey, err := base64.RawURLEncoding.DecodeString(secretB64)
-		if err != nil {
-			return app, errors.New(prefix + "AES_KEY_BASE64 is not a valid base64 raw url encoded string")
-		}
-		if len(aesKey) != 32 {
-			return app, errors.New(prefix + "AES_KEY_BASE64 AES key is not 32 bytes long")
-		}
-		aes, err := aes.NewCipher(aesKey)
-		if err != nil {
-			return app, fmt.Errorf("failed to make aes cipher from secret key %sAES_KEY_BASE64 (%s)", prefix, err)
-		}
-		cipherAEAD, err := cipher.NewGCM(aes)
-		if err != nil {
-			return app, fmt.Errorf("failed to make gcm aead aes cipher from secret key %sAES_KEY_BASE64 (%s)", prefix, err)
-		}
-
-		// CW_CLIENT_KEY_NAME
-		cert.KeyName = os.Getenv(prefix + "KEY_NAME")
-		if cert.KeyName == "" {
-			return app, errors.New(prefix + "KEY_NAME is required")
-		}
-
-		// CW_CLIENT_KEY_APIKEY
-		cert.KeyApiKey = os.Getenv(prefix + "KEY_APIKEY")
-		if cert.KeyApiKey == "" {
-			return app, errors.New(prefix + "KEY_APIKEY is required")
-		}
-
-		// CW_CLIENT_CERT_NAME
-		cert.CertName = os.Getenv(prefix + "CERT_NAME")
 		if cert.CertName == "" {
 			return app, errors.New(prefix + "CERT_NAME is required")
 		}
@@ -269,9 +253,28 @@ func configureApp() (*app, error) {
 			return app, errors.New(prefix + "CERT_APIKEY is required")
 		}
 
+		// CW_CLIENT_KEY_APIKEY
+		cert.KeyApiKey = os.Getenv(prefix + "KEY_APIKEY")
+		if cert.KeyApiKey == "" {
+			return app, errors.New(prefix + "KEY_APIKEY is required")
+		}
+
+		// Cert: Deprecated
+
+		// CW_CLIENT_AES_KEY_BASE64
+		if os.Getenv(prefix+"AES_KEY_BASE64") != "" {
+			app.logger.Warnf("%sAES_KEY_BASE64 is set but is no longer used (the client polls the server instead of receiving pushed updates), ignoring", prefix)
+		}
+
+		// CW_CLIENT_KEY_NAME
+		if os.Getenv(prefix+"KEY_NAME") != "" {
+			app.logger.Debugf("%sKEY_NAME is set but is no longer used (the key is fetched together with the certificate), ignoring", prefix)
+		}
+
 		// Cert: Optional
 
 		// CW_CLIENT_FILE_UPDATE_TIME_START
+		var err error
 		fileUpdateTimeStartString := os.Getenv(prefix + "FILE_UPDATE_TIME_START")
 		cert.FileUpdateTimeStartHour, cert.FileUpdateTimeStartMinute, err = parseTimeString(fileUpdateTimeStartString)
 		if err != nil {
@@ -484,8 +487,8 @@ func configureApp() (*app, error) {
 		// append cert
 		app.cfg.Certs = append(app.cfg.Certs, cert)
 		app.tlsCerts = append(app.tlsCerts, NewSafeCert())
-		app.cipherAEAD = append(app.cipherAEAD, cipherAEAD)
 		app.pendingJobCancels = append(app.pendingJobCancels, nil)
+		app.pollETags = append(app.pollETags, "")
 
 		// make cert storage path (if not exist)
 		_, err = os.Stat(app.cfg.Certs[certIndex].CertStoragePath)
@@ -505,23 +508,6 @@ func configureApp() (*app, error) {
 	}
 
 	// end config
-
-	// for client use -- read existing key/cert pem from disk
-	cert, err := os.ReadFile(app.cfg.Certs[0].CertStoragePath + "/" + app.cfg.Certs[0].CertPemFilename)
-	if err != nil {
-		app.logger.Infof("could not read cert (%s) from disk (%s), will try fetch from remote", app.cfg.Certs[0].CertPemFilename, err)
-	} else {
-		key, err := os.ReadFile(app.cfg.Certs[0].CertStoragePath + "/" + app.cfg.Certs[0].KeyPemFilename)
-		if err != nil {
-			app.logger.Infof("could not read key (%s) from disk (%s), will try fetch from remote", app.cfg.Certs[0].KeyPemFilename, err)
-		} else {
-			// read both key and cert, put them in tlsCert
-			_, err := app.tlsCerts[0].Update(key, cert)
-			if err != nil {
-				app.logger.Errorf("could not use key/cert pair from disk (%s), will try fetch from remote", err)
-			}
-		}
-	}
 
 	// graceful shutdown stuff
 	shutdownContext, doShutdown := context.WithCancel(context.Background())

@@ -85,22 +85,45 @@ func (app *app) nextFileUpdateWindowStart(certIndex int) time.Time {
 	return nextWindow.Add(time.Duration(addDays) * 24 * time.Hour)
 }
 
+// cancelPendingJob cancels the pending file write job of the specified cert, if there is one
+func (app *app) cancelPendingJob(certIndex int) {
+	app.pendingJobMu.Lock()
+	defer app.pendingJobMu.Unlock()
+
+	if app.pendingJobCancels[certIndex] != nil {
+		app.pendingJobCancels[certIndex]()
+		app.pendingJobCancels[certIndex] = nil
+	}
+}
+
+// replacePendingJob cancels the pending file write job of the specified cert (if there is one),
+// registers a new job in its place and returns the new job's context and cancel func
+func (app *app) replacePendingJob(certIndex int) (context.Context, context.CancelFunc) {
+	app.pendingJobMu.Lock()
+	defer app.pendingJobMu.Unlock()
+
+	if app.pendingJobCancels[certIndex] != nil {
+		app.pendingJobCancels[certIndex]()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	app.pendingJobCancels[certIndex] = cancel
+
+	return ctx, cancel
+}
+
 // scheduleJobWriteCertsMemoryToDisk schedules a job to write the client's
 // key/cert pem from memory to disk (and generate any additional files on disk that
-// are configured)
+// are configured). It cancels and replaces any pending job for the cert.
 func (app *app) scheduleJobWriteCertsMemoryToDisk(certIndex int) {
-	go func() {
-		// cancel any old job
-		if app.pendingJobCancels[certIndex] != nil {
-			app.pendingJobCancels[certIndex]()
-		}
+	// cancel any old job and register this one BEFORE starting it, so the caller (and anything
+	// that runs after it) always sees the current job
+	ctx, cancel := app.replacePendingJob(certIndex)
 
-		// make new cancel context for this job
-		ctx, cancel := context.WithCancel(context.Background())
-		// always defer cancel in case something weird happens (e.g. cancelFunc
-		// race causes overwritten before being called)
+	go func() {
+		// always cancel when done to release the context (cancelPendingJob may call the registered
+		// cancel func again later, which is harmless)
 		defer cancel()
-		app.pendingJobCancels[certIndex] = cancel
 
 		// determine when this job should run and log it
 		now := time.Now().Round(time.Minute)
@@ -142,58 +165,5 @@ func (app *app) scheduleJobWriteCertsMemoryToDisk(certIndex int) {
 		}
 
 		app.logger.Infof("write cert %d job complete", certIndex)
-	}()
-}
-
-// scheduleJobFetchCertsAndWriteToDisk fetches the latest key/cert from server
-// and updates the client's key/cert. It repeats this task every 15 minutes until
-// it succeeds. Then it schedules a job to write client's key/cert pem from
-// memory to disk (along with any other files that are configured).
-func (app *app) scheduleJobFetchCertsAndWriteToDisk(certIndex int) {
-	go func() {
-		// cancel any old job
-		if app.pendingJobCancels[certIndex] != nil {
-			app.pendingJobCancels[certIndex]()
-		}
-
-		// make new cancel context for this job
-		ctx, cancel := context.WithCancel(context.Background())
-		// always defer cancel in case something weird happens (e.g. cancelFunc
-		// race causes overwritten before being called)
-		defer cancel()
-		app.pendingJobCancels[certIndex] = cancel
-
-		// fetch job will only wait 15 minutes (since no file write or docker restart will trigger)
-		runTime := time.Now().Round(time.Second).Add(15 * time.Minute).Add(time.Duration(rand.Intn(60)) * time.Second)
-		runTimeString := runTime.String()
-
-		app.logger.Infof("scheduling fetch cert %d job for %s", certIndex, runTimeString)
-
-		// wait for user specified run time to occur
-		select {
-		case <-ctx.Done():
-			// job canceled (presumably new job scheduled instead)
-			app.logger.Infof("fetch cert %d job scheduled for %s canceled (ctx closed - probably another job scheduled in its place)", certIndex, runTimeString)
-			// DONE
-			return
-
-		case <-time.After(time.Until(runTime)):
-			// sleep until next run
-		}
-
-		app.logger.Infof("fetch cert %d job scheduled for %s executing", certIndex, runTimeString)
-
-		// try and get newer key/cert from server
-		err := app.updateClientKeyAndCertchain(certIndex)
-		if err != nil {
-			app.logger.Errorf("failed to fetch key/cert %d from server (%s)", certIndex, err)
-			// schedule try again
-			app.scheduleJobFetchCertsAndWriteToDisk(certIndex)
-		} else {
-			// success & updated - schedule write job (which may or may not actually write depending on if files need update)
-			app.scheduleJobWriteCertsMemoryToDisk(certIndex)
-		}
-
-		app.logger.Infof("fetch cert %d job scheduled for %s complete", certIndex, runTimeString)
 	}()
 }

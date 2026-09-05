@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -36,39 +37,64 @@ func makeHttpClient() (client *http.Client) {
 	}
 }
 
-// getPemWithApiKey fetches a pem response from the Cert Warden server
-func (app *app) getPemWithApiKey(url, apiKey string) (pemContent []byte, err error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+// httpStatusError reports an unexpected http status code from the server
+type httpStatusError struct {
+	status int
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("error fetching pem (status: %d)", e.status)
+}
+
+// getPemWithApiKey fetches a pem response from the Cert Warden server. If etag is not blank, the request
+// carries If-None-Match and a 304 answer yields notModified == true with nil pemContent. newETag is the
+// ETag the server sent with the pem (blank if it sent none), or the etag passed in when the server
+// answered 304; keep it for the next request.
+func (app *app) getPemWithApiKey(ctx context.Context, url, apiKey, etag string) (pemContent []byte, newETag string, notModified bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, "", false, err
 	}
 
 	// set apiKey
 	req.Header.Set("apiKey", apiKey)
 
+	// make request conditional if the etag of the current data is known (send exactly as received)
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
+
 	// do the request
 	resp, err := app.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, "", false, err
 	}
 	defer resp.Body.Close()
 
 	// read body (before err check to ensure body is always read completely)
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, "", false, err
+	}
+
+	// not modified (only meaningful if we sent an etag)
+	if resp.StatusCode == http.StatusNotModified {
+		if etag == "" {
+			return nil, "", false, errors.New("error fetching pem (server answered 304 to a request without an etag)")
+		}
+		return nil, etag, true, nil
 	}
 
 	// error if not code 200
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("error fetching pem (status: %d)", resp.StatusCode)
+		return nil, "", false, &httpStatusError{status: resp.StatusCode}
 	}
 
 	// validate the response data is actually pem
 	pemBlock, _ := pem.Decode(bodyBytes)
 	if pemBlock == nil {
-		return nil, errors.New("error fetching pem (data from server was not valid pem data)")
+		return nil, "", false, errors.New("error fetching pem (data from server was not valid pem data)")
 	}
 
-	return bodyBytes, nil
+	return bodyBytes, resp.Header.Get("ETag"), false, nil
 }

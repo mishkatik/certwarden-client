@@ -60,11 +60,11 @@ func (app *app) updateCertFilesAndRestartContainers(certIndex int, onlyIfMissing
 			certFileUpdated = true
 
 			// if its an update, check expiration of on disk cert
-			cert, _ := pem.Decode(pemFile)
-
-			// parse DER bytes
-			derCert, err := x509.ParseCertificate(cert.Bytes)
-			if err != nil {
+			certBlock, _ := pem.Decode(pemFile)
+			if certBlock == nil {
+				// disk cert is not pem (e.g. empty or truncated file), treat as not exist
+				certFileExists = false
+			} else if derCert, err := x509.ParseCertificate(certBlock.Bytes); err != nil {
 				// disk cert not validly parsed, treat as not exist
 				certFileExists = false
 			} else if time.Now().After(derCert.NotAfter) {
@@ -194,26 +194,23 @@ func (app *app) updateCertFilesAndRestartContainers(certIndex int, onlyIfMissing
 	return diskNeedsUpdate
 }
 
-// updateClientCert validates the specified key and cert pem are valid and updates the client's cert
-// key pair in memory (if not already up to date)
-func (app *app) updateClientCert(keyPem, certPem []byte, certIndex int) error {
+// updateClientCert validates the specified key and cert pem are a valid pair and updates the
+// in-memory key/cert pair (if not already up to date); updated is true if the in-memory pair changed
+func (app *app) updateClientCert(keyPem, certPem []byte, certIndex int) (updated bool, err error) {
 	app.logger.Infof("running key/cert update of cert %d in cert warden client memory", certIndex)
 
-	// update app's key/cert (validates the pair as well, tls won't work if bad)
-	updated, err := app.tlsCerts[certIndex].Update(keyPem, certPem)
+	// update app's key/cert (validates the pair as well)
+	updated, err = app.tlsCerts[certIndex].Update(keyPem, certPem)
 	if err != nil {
-		return fmt.Errorf("failed to update key and/or cert %d in cert warden client memory (%s)", certIndex, err)
+		return false, fmt.Errorf("failed to update key and/or cert %d in cert warden client memory (%s)", certIndex, err)
 	}
 
 	// log
 	if updated {
 		app.logger.Infof("new tls key/cert %d loaded into certwarden client memory", certIndex)
-		if certIndex == 0 {
-			app.logger.Infof("certwarden client https server certificate updated")
-		}
 	} else {
-		app.logger.Infof("new tls key/cert %d same as current in cert warden client, no update performed", certIndex)
+		app.logger.Debugf("tls key/cert %d same as current in cert warden client, no update performed", certIndex)
 	}
 
-	return nil
+	return updated, nil
 }
