@@ -1,10 +1,59 @@
 # Cert Warden Client Changelog
 
+## [v0.6.0] - 2026-09-05
+
+This release replaces webhook pushes with polling: the client asks the
+Cert Warden server for its key/cert on a schedule and no longer runs an
+https server.
+
+> [!CAUTION]
+> Breaking changes:
+> - Removed the client https server and the webhook route. Port 5055 is
+>   unused; drop any port mapping and firewall rules.
+> - On the Cert Warden server, clear the `Post Processing` -> `Client`
+>   settings (client address and AES key) of each certificate, otherwise
+>   the server logs an error on every renewal when it cannot reach the
+>   client.
+> - The client ignores `CW_CLIENT_BIND_ADDRESS`, `CW_CLIENT_BIND_PORT`
+>   and `CW_CLIENT_<n>_AES_KEY_BASE64` and logs a warning if they are
+>   set. It also ignores `CW_CLIENT_<n>_KEY_NAME`. Existing
+>   configurations keep working.
+> - `CW_CLIENT_<n>_CERT_NAME` now defines which certificate indexes
+>   exist (previously `CW_CLIENT_<n>_AES_KEY_BASE64` did).
+> - Requires Cert Warden server v0.18.2 or newer.
+
+Added:
+- Poll the server for key/cert updates. The first poll runs at startup
+  and then every `CW_CLIENT_POLL_INTERVAL` (Go duration, default `6h`,
+  minimum `1m`). After a failed poll the client retries after 15
+  minutes, doubling on each consecutive failure up to the poll interval.
+- Polls are conditional (`If-None-Match` / ETag): an unchanged key/cert
+  costs one request with no body.
+- Each poll is one request to
+  `/certwarden/api/v1/download/privatecertchains/<CERT_NAME>` (with
+  `apiKey: <CERT_APIKEY>.<KEY_APIKEY>`). It returns the key and the
+  certificate chain of the same order, so they match. The server logs
+  each request (2 Info lines); a short poll interval fills its log.
+
+Changed:
+- The client no longer exits when it cannot fetch certificate 0 or an
+  api key is wrong; it logs an error and keeps retrying. If you switch a
+  certificate to another private key on the server, update
+  `CW_CLIENT_<n>_KEY_APIKEY` and restart the client.
+- The client validates a key/cert pair before storing it in memory, so
+  an invalid pair never reaches the disk.
+- The docker image builds from this repository and goes to
+  `ghcr.io/mishkatik/certwarden-client` only.
+
+Removed:
+- https server, webhook route and AES payload decryption.
+
+
 ## [v0.5.0] - 2025-04-30
 
 Add multiple certificate support. Review the config file for updated
 environment config names:
-https://github.com/gregtwallace/certwarden-client/blob/main/pkg/main/config.go
+https://github.com/mishkatik/certwarden-client/blob/main/pkg/main/config.go
 Backwards compatibility was maintained for existing installs.
 
 The ability to specify the name of key.pem and certchain.pem was added.
