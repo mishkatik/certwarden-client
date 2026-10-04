@@ -20,7 +20,8 @@ You need Cert Warden server v0.18.2 or newer.
 ## About this fork
 This fork of https://github.com/gregtwallace/certwarden-client replaces
 the webhook push with polling. Images live at
-`ghcr.io/mishkatik/certwarden-client`.
+`ghcr.io/mishkatik/certwarden-client` and
+`docker.io/mishkatik/certwarden-client`.
 
 Configure the client with environment variables.
 [pkg/main/config.go](pkg/main/config.go) lists them all,
